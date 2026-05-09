@@ -12,7 +12,6 @@ import {
 import ReactMarkdown from "react-markdown";
 import { tierNarrative, type ScoreBreakdown } from "@/lib/scoring";
 import {
-  BACKGROUND_COLLECTION_MIN_TURNS,
   OPENING_ASSISTANT_MESSAGE,
   type ExpertIndustry,
 } from "@/lib/prompts";
@@ -28,6 +27,7 @@ type AnalyzeResponse = {
     uniqueSignals: string[];
     riskSignals: string[];
     actionPlan: string[];
+    strategyPlan: string[];
   };
   score: ScoreBreakdown;
 };
@@ -171,6 +171,59 @@ export default function Home() {
     () => messages.filter((m) => m.role === "user").length,
     [messages]
   );
+
+  // Content-slot readiness: unlock by semantic coverage instead of turn/char thresholds.
+  // Required slots: scenario, decision, constraint, outcome.
+  const readiness = useMemo(() => {
+    const userText = messages
+      .filter((m) => m.role === "user" && !m.content.startsWith("【tool_result】"))
+      .map((m) => m.content)
+      .join("\n");
+
+    const slots = {
+      scenario:
+        /(场景|案例|项目|岗位|角色|客户|对象|业务|在.{0,8}(公司|团队|部门)|我负责|我在做)/.test(
+          userText
+        ),
+      decision:
+        /(决策|判断|取舍|选择|优先级|方案|为什么|当时怎么想|我会先|我通常会)/.test(
+          userText
+        ),
+      constraint:
+        /(约束|限制|资源|预算|时间|风险|冲突|阻力|压力|不确定性|不能|必须|合规)/.test(
+          userText
+        ),
+      outcome:
+        /(结果|效果|指标|复盘|改进|反馈|教训|失败|成功|收益|影响|后来)/.test(
+          userText
+        ),
+    };
+
+    const labels = {
+      scenario: "真实场景",
+      decision: "关键决策",
+      constraint: "约束与取舍",
+      outcome: "结果与复盘",
+    } as const;
+
+    const coverageCount = Object.values(slots).filter(Boolean).length;
+    const missing = (Object.keys(slots) as Array<keyof typeof slots>)
+      .filter((k) => !slots[k])
+      .map((k) => labels[k]);
+
+    const ready = fastTrack ? coverageCount >= 2 : coverageCount >= 3;
+    const pct = Math.round((coverageCount / 4) * 100);
+
+    return {
+      slots,
+      missing,
+      coverageCount,
+      contentReady: ready,
+      contentPct: pct,
+    };
+  }, [messages, fastTrack]);
+
+  const { missing, coverageCount, contentReady, contentPct } = readiness;
 
   const narrative = useMemo(() => {
     if (!result) return null;
@@ -431,6 +484,7 @@ export default function Home() {
           fastTrack,
           stream: true,
           toolContext: activeToolContext,
+          sessionId: activeSessionId,
         }),
       });
       if (!response.ok || !response.body) {
@@ -520,7 +574,7 @@ export default function Home() {
   };
 
   const generateReport = async () => {
-    if (userTurnCount < 2 || analyzing) return;
+    if (!contentReady || analyzing) return;
 
     setAnalyzing(true);
     setAnalyzeError("");
@@ -535,6 +589,7 @@ export default function Home() {
           industry: chatIndustry,
           fastTrack,
           toolContext,
+          sessionId: activeSessionId,
         }),
       });
 
@@ -680,21 +735,81 @@ export default function Home() {
             </div>
           ) : null}
 
-          <div ref={chatContainerRef} className="mt-5 h-[420px] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-4">
+          {/* Interview progress bar — content-based */}
+          {(() => {
+            const stage =
+              coverageCount === 0
+                ? "开始分享你的真实经验"
+                : coverageCount < 2
+                ? "继续深入，问问正在提炼要点"
+                : contentReady
+                ? "内容已充足，可生成报告"
+                : "继续补齐关键细节";
+            return (
+              <div className="mt-4 space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <span className={`text-xs font-semibold ${
+                    contentReady ? "text-slate-800" : "text-slate-500"
+                  }`}>
+                    {contentReady && (
+                      <span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-slate-800 align-middle animate-pulse" />
+                    )}
+                    {stage}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <span className="tabular-nums text-xs text-slate-400">
+                      内容维度 <span className="font-bold text-slate-700">{coverageCount}</span> / 4
+                    </span>
+                    {contentReady && (
+                      <button
+                        type="button"
+                        onClick={generateReport}
+                        disabled={analyzing}
+                        className="h-6 rounded-full bg-slate-900 px-3 text-[11px] font-semibold text-white transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {analyzing ? "测算中…" : "生成报告 →"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-100">
+                  <div
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      contentReady
+                        ? "bg-slate-800"
+                        : contentPct >= 60
+                        ? "bg-slate-600"
+                        : "bg-slate-400"
+                    }`}
+                    style={{ width: `${contentPct}%` }}
+                  />
+                </div>
+                {!contentReady && missing.length > 0 ? (
+                  <p className="text-[11px] text-slate-400">
+                    建议补充：{missing.join("、")}
+                  </p>
+                ) : null}
+              </div>
+            );
+          })()}
+
+          <div ref={chatContainerRef} className="chat-scroll mt-3 h-[420px] overflow-y-auto rounded-2xl border border-slate-200 bg-white p-4">
             <div className="space-y-4">
               {messages.map((message, idx) => {
                 // tool_result messages are internal — hide from user
                 if (message.content.startsWith("【tool_result】")) return null;
 
-                // tool-call messages render as a small action chip
+                // tool-call messages render as a centered capsule
                 if (message.content.startsWith("【tool:")) {
                   const label = message.content.replace(/^【tool:[^】]+】/, "").trim();
                   return (
-                    <div key={`tool-${idx}`} className="flex items-center gap-1.5 text-xs text-slate-400">
-                      <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
-                      </svg>
-                      <span>{label}</span>
+                    <div key={`tool-${idx}`} className="flex justify-center">
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-[11px] font-medium text-slate-400">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" />
+                        </svg>
+                        {label}
+                      </span>
                     </div>
                   );
                 }
@@ -705,7 +820,7 @@ export default function Home() {
                     className={`max-w-[88%] rounded-xl px-4 py-3 text-sm leading-7 ${
                       message.role === "assistant"
                         ? "bg-slate-100 text-slate-700"
-                        : "ml-auto bg-emerald-600 text-white"
+                        : "ml-auto bg-gradient-to-br from-slate-800 to-slate-900 text-slate-100 shadow-sm"
                     }`}
                   >
                     {message.role === "assistant" &&
@@ -734,65 +849,48 @@ export default function Home() {
           </div>
 
           <form className="mt-4" onSubmit={sendMessage}>
-            {/* Gemini-style unified input container */}
-            <div className="rounded-2xl border border-slate-300 bg-white transition-shadow focus-within:shadow-sm focus-within:ring-2 focus-within:ring-accent/20">
+            {/* Input container with integrated attachment button */}
+            <div className="relative rounded-2xl border border-slate-300 bg-white transition-shadow focus-within:border-slate-400 focus-within:shadow-md">
+              {/* attachment icon — inside left of textarea */}
+              <label
+                title="上传文档（.txt .md .html）"
+                className="absolute left-3 top-3 flex h-7 w-7 cursor-pointer items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-slate-100 hover:text-slate-600"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                </svg>
+                <input
+                  type="file"
+                  accept=".txt,.md,.html,.htm"
+                  onChange={handleAttachFile}
+                  className="hidden"
+                />
+              </label>
+
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleInputKeyDown}
                 rows={3}
                 placeholder="聊聊你的真实思考，越反直觉的经验，护城河越深……"
-                className="w-full resize-none rounded-t-2xl px-4 pt-4 pb-1 text-sm outline-none placeholder:text-slate-400"
+                className="w-full resize-none rounded-2xl py-3 pr-14 pl-11 text-sm outline-none placeholder:text-slate-400"
               />
-              {/* bottom action bar */}
-              <div className="flex items-center gap-2 px-3 pb-3 pt-1">
-                {/* + file attachment */}
-                <label
-                  title="上传文档（.txt .md .html）"
-                  className="flex h-9 w-9 cursor-pointer items-center justify-center rounded-xl border border-slate-200 text-slate-500 transition-colors hover:bg-slate-50 active:bg-slate-100"
-                >
-                  <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+
+              {/* send button — inside right */}
+              <button
+                type="submit"
+                disabled={chatLoading || !input.trim()}
+                title="发送（Enter）"
+                className="absolute right-3 bottom-3 flex h-8 w-8 items-center justify-center rounded-xl bg-slate-900 text-white shadow transition-opacity hover:opacity-80 disabled:cursor-not-allowed disabled:opacity-30"
+              >
+                {chatLoading ? (
+                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                ) : (
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" />
                   </svg>
-                  <input
-                    type="file"
-                    accept=".txt,.md,.html,.htm"
-                    onChange={handleAttachFile}
-                    className="hidden"
-                  />
-                </label>
-
-                <span className="flex-1" />
-
-                {/* generate report */}
-                <button
-                  type="button"
-                  onClick={generateReport}
-                  disabled={
-                    analyzing ||
-                    userTurnCount < (fastTrack ? 1 : BACKGROUND_COLLECTION_MIN_TURNS)
-                  }
-                  className="h-9 rounded-xl px-3 text-xs font-semibold text-slate-500 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {analyzing ? "测算中…" : "生成报告"}
-                </button>
-
-                {/* send */}
-                <button
-                  type="submit"
-                  disabled={chatLoading || !input.trim()}
-                  title="发送（Enter）"
-                  className="flex h-9 w-9 items-center justify-center rounded-xl bg-emerald-600 text-white shadow-sm transition-colors hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {chatLoading ? (
-                    <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
-                  ) : (
-                    <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d="M5 10l7-7m0 0l7 7m-7-7v18" />
-                    </svg>
-                  )}
-                </button>
-              </div>
+                )}
+              </button>
             </div>
             {chatError ? <p className="mt-2 text-sm font-medium text-red-600">{chatError}</p> : null}
             {analyzeError ? <p className="mt-2 text-sm font-medium text-red-600">{analyzeError}</p> : null}
@@ -801,10 +899,59 @@ export default function Home() {
 
         <div className="glass-card rounded-3xl p-6 sm:p-8">
           <h2 className="text-2xl font-black text-slate-900">不可替代指数报告</h2>
+          {/* brand accent line */}
+          <div className="mt-2 h-0.5 w-12 rounded-full bg-gradient-to-r from-accent-2 to-accent" />
           {!result ? (
-            <p className="mt-6 text-sm leading-7 text-slate-600">
-              AI每天都在&ldquo;学习&rdquo;你的行业。完成追问后，这里将生成你的不可替代指数评分——哪些能力机器还拿不走，哪些正面临被替代的风险，以及你该如何加固护城河。
-            </p>
+            <div className="mt-6 space-y-5">
+              <p className="text-sm leading-7 text-slate-600">
+                AI每天都在&ldquo;学习&rdquo;你的行业。完成追问后，这里将生成你的不可替代指数评分——哪些能力机器还拿不走，哪些正面临被替代的风险，以及你该如何加固护城河。
+              </p>
+              {/* Radar skeleton — suggests multi-dimensional analysis being built */}
+              <div className="flex flex-col items-center gap-4 py-4">
+                <div className="relative h-44 w-44">
+                  {/* concentric hexagons via SVG */}
+                  <svg viewBox="0 0 160 160" className="h-full w-full" fill="none">
+                    {[70, 52, 34].map((r, i) => (
+                      <polygon
+                        key={r}
+                        points={[0,1,2,3,4,5].map(j => {
+                          const a = (j * Math.PI) / 3 - Math.PI / 6;
+                          return `${80 + r * Math.cos(a)},${80 + r * Math.sin(a)}`;
+                        }).join(" ")}
+                        stroke="#e2e8f0"
+                        strokeWidth={i === 0 ? 1.5 : 1}
+                        className="origin-center"
+                      />
+                    ))}
+                    {/* axis lines */}
+                    {[0,1,2,3,4,5].map(j => {
+                      const a = (j * Math.PI) / 3 - Math.PI / 6;
+                      return <line key={j} x1="80" y1="80" x2={80 + 70 * Math.cos(a)} y2={80 + 70 * Math.sin(a)} stroke="#e2e8f0" strokeWidth="1" />;
+                    })}
+                    {/* animated fill polygon — breathing */}
+                    <polygon
+                      points={[0,1,2,3,4,5].map(j => {
+                        const a = (j * Math.PI) / 3 - Math.PI / 6;
+                        const r = [45, 38, 55, 42, 50, 40][j];
+                        return `${80 + r * Math.cos(a)},${80 + r * Math.sin(a)}`;
+                      }).join(" ")}
+                      fill="rgba(19,62,135,0.08)"
+                      stroke="rgba(19,62,135,0.25)"
+                      strokeWidth="1.5"
+                      className="animate-pulse"
+                    />
+                    {/* dots at vertices */}
+                    {[45, 38, 55, 42, 50, 40].map((r, j) => {
+                      const a = (j * Math.PI) / 3 - Math.PI / 6;
+                      return <circle key={j} cx={80 + r * Math.cos(a)} cy={80 + r * Math.sin(a)} r="3" fill="rgba(19,62,135,0.35)" className="animate-pulse" />;
+                    })}
+                  </svg>
+                </div>
+                <p className="text-xs text-slate-400">
+                  完成追问后，系统将构建你的六维能力坐标
+                </p>
+              </div>
+            </div>
           ) : (
             <div className="mt-6 space-y-5">
               <div className="rounded-2xl bg-gradient-to-r from-accent-2 to-accent p-[1px]">
@@ -827,7 +974,7 @@ export default function Home() {
               ) : null}
 
               <div className="space-y-2">
-                <p className="text-sm font-bold text-slate-900">不可替代性摘要</p>
+                <p className="text-sm font-bold text-slate-900">现状分析</p>
                 <p className="text-sm leading-7 text-slate-700">{result.distillation.summary}</p>
               </div>
 
@@ -854,15 +1001,28 @@ export default function Home() {
               </div>
 
               <div className="space-y-2">
-                <p className="text-sm font-bold text-slate-900">强化不可替代性：7 天行动</p>
+                <p className="text-sm font-bold text-slate-900">近期行动（30天）</p>
                 <ul className="space-y-2 text-sm text-slate-700">
                   {result.distillation.actionPlan.map((item) => (
-                    <li key={item} className="rounded-lg bg-emerald-50 px-3 py-2">
+                    <li key={item} className="rounded-lg bg-white px-3 py-2">
                       • {item}
                     </li>
                   ))}
                 </ul>
               </div>
+
+              {result.distillation.strategyPlan?.length ? (
+                <div className="space-y-2">
+                  <p className="text-sm font-bold text-slate-900">未来发展策略（3-12个月）</p>
+                  <ul className="space-y-2 text-sm text-slate-700">
+                    {result.distillation.strategyPlan.map((item) => (
+                      <li key={item} className="rounded-lg bg-violet-50 px-3 py-2">
+                        • {item}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
           )}
         </div>

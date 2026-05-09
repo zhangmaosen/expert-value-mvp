@@ -57,3 +57,27 @@ body {
   font-size: 0.78rem;
   color: var(--muted);
 }
+
+/* Custom slim scrollbar for chat area */
+.chat-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color 0.2s;
+}
+.chat-scroll:hover {
+  scrollbar-color: rgba(100, 116, 139, 0.25) transparent;
+}
+.chat-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+.chat-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.chat-scroll::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 9999px;
+  transition: background-color 0.2s;
+}
+.chat-scroll:hover::-webkit-scrollbar-thumb {
+  background-color: rgba(100, 116, 139, 0.25);
+}

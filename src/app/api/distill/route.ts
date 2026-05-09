@@ -1,3 +1,6 @@
+import { mkdir, appendFile } from "node:fs/promises";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { calculateScore, type AssessmentAnswers } from "@/lib/scoring";
 import {
@@ -18,6 +21,7 @@ type DistillPayload = {
   fastTrack?: boolean;
   stream?: boolean;
   toolContext?: string;
+  sessionId?: string;
 };
 
 type DistillOutput = {
@@ -25,11 +29,22 @@ type DistillOutput = {
   uniqueSignals: string[];
   riskSignals: string[];
   actionPlan: string[];
+  strategyPlan: string[];
 };
 
 const BASE_URL = process.env.MINIMAX_BASE_URL || "https://api.minimaxi.com/v1";
 const MODEL = process.env.MINIMAX_MODEL || "MiniMax-M2.7-highspeed";
 const DEFAULT_INDUSTRY: ExpertIndustry = "其他";
+const LOG_FILE = path.join(process.cwd(), "data", "chat-logs.ndjson");
+
+async function logChatEvent(record: Record<string, unknown>): Promise<void> {
+  try {
+    await mkdir(path.dirname(LOG_FILE), { recursive: true });
+    await appendFile(LOG_FILE, JSON.stringify(record) + "\n", "utf8");
+  } catch {
+    // Never let logging errors surface to the user
+  }
+}
 
 function getReplyStage(userTurns: number, fastTrack: boolean) {
   if (fastTrack) return "fast-track";
@@ -239,7 +254,10 @@ function extractJson(raw: string): DistillOutput | null {
         summary: parsed.summary,
         uniqueSignals: parsed.uniqueSignals.slice(0, 4),
         riskSignals: parsed.riskSignals.slice(0, 4),
-        actionPlan: parsed.actionPlan.slice(0, 4),
+        actionPlan: parsed.actionPlan.slice(0, 3),
+        strategyPlan: Array.isArray(parsed.strategyPlan)
+          ? parsed.strategyPlan.slice(0, 4)
+          : [],
       };
     }
   } catch {
@@ -291,9 +309,15 @@ function fallbackDistill(answers: AssessmentAnswers): DistillOutput {
       ? risks
       : ["建议尽快建立可复用模板，避免优势停留在个人经验。"],
     actionPlan: [
-      "7 天内完成一个高频场景的分析模板（问题、变量、证据、结论）。",
+      "30 天内完成一个高频场景的分析模板（问题、变量、证据、结论）。",
       "将最近一次案例复盘为可复用流程，建立团队共享版本。",
       "每周固定一次 AI 协同回顾，跟踪效率提升与质量波动。",
+    ],
+    strategyPlan: [
+      "构建个人方法论体系：将核心判断框架文档化，形成可传授的知识资产。",
+      "差异化定位：识别行业内 AI 难以替代的 3 个细分场景，聚焦深耕。",
+      "AI 协同升级：系统学习 1-2 个与本职工作深度结合的 AI 工具，提升交付杠杆。",
+      "建立外部影响力：通过内容输出或社群参与，将隐性经验转化为可见的专业品牌。",
     ],
   };
 }
@@ -428,7 +452,7 @@ async function callMiniMaxForReport(
       temperature: 0.2,
       n: 1,
       stream: false,
-      max_completion_tokens: 1400,
+      max_completion_tokens: 1800,
     }),
   });
 
@@ -456,6 +480,7 @@ async function callMiniMaxForReport(
       uniqueSignals: string[];
       riskSignals: string[];
       actionPlan: string[];
+      strategyPlan: string[];
     };
 
     const report = extractJson(
@@ -464,6 +489,7 @@ async function callMiniMaxForReport(
         uniqueSignals: parsed.uniqueSignals,
         riskSignals: parsed.riskSignals,
         actionPlan: parsed.actionPlan,
+        strategyPlan: parsed.strategyPlan,
       })
     );
     if (!report) return null;
@@ -490,6 +516,9 @@ export async function POST(request: Request) {
     const fastTrack = Boolean(payload.fastTrack);
     const stream = Boolean(payload.stream);
     const toolContext = normalizeToolContext(payload.toolContext);
+    const sessionId = typeof payload.sessionId === "string" && payload.sessionId
+      ? payload.sessionId
+      : randomUUID();
 
     if (mode === "reply") {
       const userTurns = messages.filter((m) => m.role === "user").length;
@@ -503,6 +532,20 @@ export async function POST(request: Request) {
           stage,
           toolContext
         );
+
+        // Log the latest user turn (fire-and-forget)
+        const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
+        if (lastUserMsg) {
+          void logChatEvent({
+            event: "turn",
+            ts: new Date().toISOString(),
+            sessionId,
+            industry,
+            fastTrack,
+            userTurnCount: userTurns,
+            userMessage: lastUserMsg.content,
+          });
+        }
 
         return new Response(replyStream, {
           headers: {
@@ -533,6 +576,20 @@ export async function POST(request: Request) {
     console.log("[distill/report] answers:", JSON.stringify(answers));
     console.log("[distill/report] score:", JSON.stringify(score));
     console.log("[distill/report] modelUsed:", reportFromModel ? "LLM" : "fallback");
+
+    // Log full session on report generation (fire-and-forget)
+    void logChatEvent({
+      event: "report",
+      ts: new Date().toISOString(),
+      sessionId,
+      industry,
+      fastTrack,
+      userTurnCount: messages.filter((m) => m.role === "user").length,
+      messages,
+      answers,
+      score,
+      distillation: report,
+    });
 
     return NextResponse.json({ distillation: report, score, answers });
   } catch (err) {
