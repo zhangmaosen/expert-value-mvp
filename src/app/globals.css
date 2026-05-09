@@ -1,0 +1,59 @@
+@import "tailwindcss";
+
+:root {
+  --background: #f7f1e6;
+  --foreground: #1a1b1f;
+  --accent: #0d7f63;
+  --accent-2: #133e87;
+  --card: #fffdf8;
+  --muted: #6b7280;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-accent: var(--accent);
+  --color-accent-2: var(--accent-2);
+  --color-card: var(--card);
+  --color-muted: var(--muted);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), "Noto Sans SC", "PingFang SC", sans-serif;
+  background-image:
+    radial-gradient(circle at 10% 10%, rgba(19, 62, 135, 0.08), transparent 30%),
+    radial-gradient(circle at 90% 20%, rgba(13, 127, 99, 0.12), transparent 35%),
+    linear-gradient(180deg, #f7f1e6 0%, #fefbf4 100%);
+}
+
+.glass-card {
+  background: color-mix(in oklab, var(--card) 92%, white);
+  border: 1px solid rgba(19, 62, 135, 0.12);
+  box-shadow: 0 18px 40px rgba(19, 62, 135, 0.08);
+}
+
+.button-primary {
+  background: linear-gradient(135deg, var(--accent-2), var(--accent));
+  color: #f8fafc;
+  transition: transform 160ms ease, box-shadow 160ms ease;
+}
+
+.button-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 22px rgba(19, 62, 135, 0.28);
+}
+
+.field-label {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #213547;
+}
+
+.field-help {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
