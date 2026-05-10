@@ -3,10 +3,10 @@ export type PromptChatMessage = {
   content: string;
 };
 
-export const PROMPT_VERSION = "v1.2.0";
+export const PROMPT_VERSION = "v1.3.0";
 
-// 问问：一个专注追问的可爱 Agent，名字即能力——通过不断追问把隐性知识带到明面上。
-export const AGENT_NAME = "问问";
+// 省吾：取自“三省吾身”，强调通过持续追问与反思把隐性知识带到明面上。
+export const AGENT_NAME = "省吾";
 
 export const BACKGROUND_COLLECTION_MIN_TURNS = 5;
 
@@ -47,12 +47,13 @@ const INDUSTRY_PATHWAY: Record<ExpertIndustry, string> = {
 };
 
 export const OPENING_ASSISTANT_MESSAGE =
-  'AI正在接管越来越多的"专业工作"——但每个人都有机器难以复制的判断力与实战直觉。我是问问，接下来会通过一系列追问，帮你把这些隐性优势量化成"不可替代指数"。先介绍一下自己：你叫什么名字？';
+  `我是${AGENT_NAME}，我们轻松聊聊。怎么称呼你？你现在主要做什么方向？资料或 URL 随时可补充，不影响访谈。`;
 
 export function buildInterviewSystemPrompt(
   industry: ExpertIndustry,
   userTurnCount: number,
-  fastTrack: boolean
+  fastTrack: boolean,
+  interviewPlan?: string[]
 ): string {
   const stageGuide =
     fastTrack
@@ -61,10 +62,18 @@ export function buildInterviewSystemPrompt(
       ? `当前阶段是背景采集（至少${BACKGROUND_COLLECTION_MIN_TURNS}轮用户回答）：优先收集岗位角色、从业年限、主要服务对象、擅长问题类型、常用方法和工具。问题保持低门槛，不要要求长篇输入。`
       : "当前阶段是路径化深问：基于已获取背景，先给出一句后续分析路径，再追问关键判断、失败修正和方法迁移。";
 
-  return `你是问问——一个专注追问的 AI 助手，擅长通过层层追问把人们脑中不可言传的隐性知识带到明面上。目标是通过对话识别用户哪些能力无法被AI替代，从而生成精准的"不可替代指数"评估。
+  const planSection =
+    interviewPlan && interviewPlan.length > 0
+      ? `\n访谈计划（必须优先参考并执行）：\n${interviewPlan
+          .map((item, idx) => `  ${idx + 1}. ${item}`)
+          .join("\n")}\n执行要求：每轮优先推进计划中的下一项；若用户回答引出更深细节，可在同一项下追问1轮，再回到计划主线。`
+      : "\n当前尚无访谈计划：优先建议用户上传个人资料/报道/项目文档（或URL）以提升追问精度；若用户选择直接开始，也必须继续深访，不得因缺少资料而中断或拒绝推进。";
+
+  return `你是${AGENT_NAME}——一个专注追问的 AI 助手，擅长通过层层追问把人们脑中不可言传的隐性知识带到明面上。目标是通过对话识别用户哪些能力无法被AI替代，从而生成精准的"不可替代指数"评估。
 行业：${industry}。行业聚焦：${INDUSTRY_FOCUS[industry]}
 建议的后续分析路径：${INDUSTRY_PATHWAY[industry]}
 ${stageGuide}
+${planSection}
 称呼规则：
   • 在整个对话中，持续从所有可用信息里推断用户姓名，信号来源包括但不限于：
     - 用户直接说出名字（"我叫X"、"我是X"）
@@ -111,6 +120,70 @@ Agent 工具协议：对话历史中可能出现以下标记——
   • 【tool_result】：紧随其后，是工具返回的结果摘要，资料全文已在系统 prompt 的外部资料节中。
 当你在消息历史中看到这两条标记时，说明资料已完整加载，你必须立刻基于资料内容提出一个与当前阶段匹配的追问（先低门槛，再深问），推进访谈目标。禁止说"我来看看"、"稍等"等等待措辞。
 资料邀请：若用户提到文章或报道但未附链接，自然邀请其粘贴 URL。`;
+}
+
+export function buildInterviewPlanPrompt(
+  toolContext: string,
+  industry: ExpertIndustry
+): string {
+  return `你是资深访谈设计师。请基于用户资料，输出一份“深度访谈计划”，用于后续逐轮追问隐性知识。
+
+目标：
+1) 从资料中提炼最值得深挖的能力信号
+2) 形成由浅入深、可执行的追问路径
+3) 每个问题都要能引出“场景-判断-取舍-结果”中的至少一个关键要素
+
+输出要求（仅输出JSON，不要其他文字）：
+{
+  "plan": ["字符串", "字符串", "字符串", "字符串", "字符串"],
+  "summary": "40-80字，说明这份计划最核心的深挖方向"
+}
+
+约束：
+- plan固定5条，按执行顺序排列
+- 每条必须具体，避免泛泛而谈
+- 语言简洁，便于问答场景直接使用
+- 结合行业：${industry}（${INDUSTRY_FOCUS[industry]}）
+
+【用户资料】
+${toolContext}`;
+}
+
+export function buildInterviewReplanPrompt(
+  industry: ExpertIndustry,
+  currentPlan: string[],
+  conversationContext: string,
+  toolContext: string
+): string {
+  return `你是资深访谈设计师。你将基于“初始计划 + 最新对话进展”进行滚动 re-plan，输出更贴近当前用户状态的下一版访谈计划。
+
+目标：
+1) 保留仍有效的问题主线
+2) 删除已经回答充分或不再 relevant 的问题
+3) 将用户新暴露的高价值线索纳入计划
+4) 保持问题顺序能直接用于下一轮追问
+
+输出要求（仅输出JSON，不要任何额外文字）：
+{
+  "plan": ["字符串", "字符串", "字符串", "字符串", "字符串"],
+  "summary": "40-80字，说明这次re-plan后的核心追问方向"
+}
+
+约束：
+- 始终输出5条，按执行顺序排列
+- 每条必须具体，能直接作为问句主轴
+- 语言简洁，避免空泛口号
+- 如果原计划里有高价值但尚未深挖的条目，应优先保留
+- 结合行业：${industry}（${INDUSTRY_FOCUS[industry]}）
+
+【当前计划】
+${currentPlan.map((x, i) => `${i + 1}. ${x}`).join("\n") || "（暂无）"}
+
+【最新对话进展】
+${conversationContext || "（暂无）"}
+
+【资料上下文】
+${toolContext || "（暂无）"}`;
 }
 
 export function getFallbackQuestion(

@@ -1,10 +1,12 @@
-import { mkdir, appendFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 import { calculateScore, type AssessmentAnswers } from "@/lib/scoring";
 import {
   BACKGROUND_COLLECTION_MIN_TURNS,
+  buildInterviewPlanPrompt,
+  buildInterviewReplanPrompt,
   buildReportPrompt,
   buildInterviewSystemPrompt,
   getFallbackQuestion,
@@ -15,13 +17,14 @@ import {
 type ChatMessage = PromptChatMessage;
 
 type DistillPayload = {
-  mode?: "reply" | "report";
+  mode?: "reply" | "report" | "plan";
   messages?: ChatMessage[];
   industry?: ExpertIndustry;
   fastTrack?: boolean;
   stream?: boolean;
   toolContext?: string;
   sessionId?: string;
+  interviewPlan?: string[];
 };
 
 type DistillOutput = {
@@ -32,15 +35,62 @@ type DistillOutput = {
   strategyPlan: string[];
 };
 
+type PlanOutput = {
+  plan: string[];
+  summary: string;
+};
+
 const BASE_URL = process.env.MINIMAX_BASE_URL || "https://api.minimaxi.com/v1";
 const MODEL = process.env.MINIMAX_MODEL || "MiniMax-M2.7-highspeed";
 const DEFAULT_INDUSTRY: ExpertIndustry = "其他";
-const LOG_FILE = path.join(process.cwd(), "data", "chat-logs.ndjson");
+const LOG_DIR = path.join(process.cwd(), "data", "chat-logs");
+const REPLAN_TIMEOUT_MS = 1200;
 
-async function logChatEvent(record: Record<string, unknown>): Promise<void> {
+type SessionLog = {
+  sessionId: string;
+  createdAt: string;
+  updatedAt: string;
+  events: Array<Record<string, unknown>>;
+};
+
+function normalizeSessionId(sessionId: string): string {
+  const cleaned = sessionId.replace(/[^a-zA-Z0-9_-]/g, "_").trim();
+  return cleaned || "unknown-session";
+}
+
+async function logChatEvent(
+  sessionId: string,
+  record: Record<string, unknown>
+): Promise<void> {
   try {
-    await mkdir(path.dirname(LOG_FILE), { recursive: true });
-    await appendFile(LOG_FILE, JSON.stringify(record) + "\n", "utf8");
+    await mkdir(LOG_DIR, { recursive: true });
+
+    const normalizedSessionId = normalizeSessionId(sessionId);
+    const logFile = path.join(LOG_DIR, `${normalizedSessionId}.json`);
+    const now = new Date().toISOString();
+
+    let current: SessionLog | null = null;
+    try {
+      const raw = await readFile(logFile, "utf8");
+      const parsed = JSON.parse(raw) as SessionLog;
+      if (parsed && Array.isArray(parsed.events)) {
+        current = parsed;
+      }
+    } catch {
+      current = null;
+    }
+
+    const next: SessionLog = current ?? {
+      sessionId: normalizedSessionId,
+      createdAt: now,
+      updatedAt: now,
+      events: [],
+    };
+
+    next.updatedAt = now;
+    next.events.push(record);
+
+    await writeFile(logFile, JSON.stringify(next, null, 2), "utf8");
   } catch {
     // Never let logging errors surface to the user
   }
@@ -53,19 +103,41 @@ function getReplyStage(userTurns: number, fastTrack: boolean) {
     : "deep-analysis";
 }
 
-function createFallbackReplyStream(reply: string, stage: string) {
+function normalizePlanItems(plan: unknown, maxLen = 8): string[] {
+  if (!Array.isArray(plan)) return [];
+  return plan
+    .map((x) => (typeof x === "string" ? x.trim() : ""))
+    .filter(Boolean)
+    .slice(0, maxLen);
+}
+
+type ReplanOutput = {
+  plan: string[];
+  summary: string;
+};
+
+function createFallbackReplyStream(
+  reply: string,
+  stage: string,
+  onFinalReply?: (assistantReply: string, status: "done" | "error") => void,
+  doneMeta?: { interviewPlan?: string[]; planUpdated?: boolean }
+) {
   const encoder = new TextEncoder();
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
+      const cleanedReply = sanitizeModelText(reply);
       controller.enqueue(
         encoder.encode(
-          `${JSON.stringify({ type: "delta", content: sanitizeModelText(reply) })}\n`
+          `${JSON.stringify({ type: "delta", content: cleanedReply })}\n`
         )
       );
       controller.enqueue(
-        encoder.encode(`${JSON.stringify({ type: "done", stage })}\n`)
+        encoder.encode(
+          `${JSON.stringify({ type: "done", stage, ...doneMeta })}\n`
+        )
       );
+      onFinalReply?.(cleanedReply, "done");
       controller.close();
     },
   });
@@ -76,7 +148,10 @@ async function createMiniMaxReplyStream(
   industry: ExpertIndustry,
   fastTrack: boolean,
   stage: string,
-  toolContext: string
+  toolContext: string,
+  interviewPlan: string[],
+  onFinalReply?: (assistantReply: string, status: "done" | "error") => void,
+  doneMeta?: { interviewPlan?: string[]; planUpdated?: boolean }
 ): Promise<ReadableStream<Uint8Array>> {
   const key = process.env.MINIMAX_API_KEY;
   const userTurnCount = messages.filter((m) => m.role === "user").length;
@@ -84,7 +159,9 @@ async function createMiniMaxReplyStream(
   if (!key) {
     return createFallbackReplyStream(
       fallbackReply(messages, industry, fastTrack),
-      stage
+      stage,
+      onFinalReply,
+      doneMeta
     );
   }
 
@@ -92,7 +169,7 @@ async function createMiniMaxReplyStream(
     {
       role: "system",
       content:
-        buildInterviewSystemPrompt(industry, userTurnCount, fastTrack) +
+        buildInterviewSystemPrompt(industry, userTurnCount, fastTrack, interviewPlan) +
         (toolContext ? `\n\n外部资料参考（优先用于追问与校验）：\n${toolContext}` : ""),
     },
     ...messages.map((m) => ({ role: m.role, content: m.content })),
@@ -118,7 +195,9 @@ async function createMiniMaxReplyStream(
   if (!upstream.ok || !upstream.body) {
     return createFallbackReplyStream(
       fallbackReply(messages, industry, fastTrack),
-      stage
+      stage,
+      onFinalReply,
+      doneMeta
     );
   }
 
@@ -129,6 +208,7 @@ async function createMiniMaxReplyStream(
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       let buffer = "";
+      let assistantReply = "";
       try {
         while (true) {
           const { done, value } = await reader.read();
@@ -159,6 +239,8 @@ async function createMiniMaxReplyStream(
                 "";
               if (!delta) continue;
 
+              assistantReply += delta;
+
               controller.enqueue(
                 encoder.encode(
                   `${JSON.stringify({
@@ -174,8 +256,11 @@ async function createMiniMaxReplyStream(
         }
 
         controller.enqueue(
-          encoder.encode(`${JSON.stringify({ type: "done", stage })}\n`)
+          encoder.encode(
+            `${JSON.stringify({ type: "done", stage, ...doneMeta })}\n`
+          )
         );
+        onFinalReply?.(sanitizeModelText(assistantReply), "done");
         controller.close();
       } catch {
         controller.enqueue(
@@ -186,6 +271,7 @@ async function createMiniMaxReplyStream(
             })}\n`
           )
         );
+        onFinalReply?.(sanitizeModelText(assistantReply), "error");
         controller.close();
       } finally {
         reader.releaseLock();
@@ -380,7 +466,8 @@ async function callMiniMaxForReply(
   messages: ChatMessage[],
   industry: ExpertIndustry,
   fastTrack: boolean,
-  toolContext: string
+  toolContext: string,
+  interviewPlan: string[]
 ): Promise<string | null> {
   const key = process.env.MINIMAX_API_KEY;
   if (!key) return null;
@@ -391,7 +478,7 @@ async function callMiniMaxForReply(
     {
       role: "system",
       content:
-        buildInterviewSystemPrompt(industry, userTurnCount, fastTrack) +
+        buildInterviewSystemPrompt(industry, userTurnCount, fastTrack, interviewPlan) +
         (toolContext ? `\n\n外部资料参考（优先用于追问与校验）：\n${toolContext}` : ""),
     },
     ...messages.map((m) => ({ role: m.role, content: m.content })),
@@ -425,6 +512,171 @@ async function callMiniMaxForReply(
 
   const cleaned = sanitizeModelText(raw);
   return cleaned || null;
+}
+
+function fallbackPlan(toolContext: string): PlanOutput {
+  const base = toolContext.trim();
+  const hasMaterial = base.length > 0;
+  return {
+    plan: hasMaterial
+      ? [
+          "先确认资料中最关键的一段实战场景：当时目标、角色与约束是什么？",
+          "追问该场景中的关键判断：你当时为何否定了其他可选方案？",
+          "拆解取舍过程：在时间、风险、资源冲突下，你优先保护了什么？",
+          "回看结果与复盘：哪些信号验证了你的判断，哪些地方被你修正？",
+          "提炼可迁移方法：如果让新人复现，你会给哪三条不可省略的判断准则？",
+        ]
+      : [
+          "先引导用户上传个人资料、报道或项目文档（或URL）。",
+          "确认资料真实性与代表性：哪段经历最能代表其核心能力。",
+          "围绕该经历追问关键判断与取舍。",
+          "补全结果与复盘细节，识别可复制方法。",
+          "形成可迁移的能力框架并进入深访。",
+        ],
+    summary: "按场景-判断-取舍-结果-迁移的路径逐层深挖，确保访谈有结构且可落地。",
+  };
+}
+
+async function callMiniMaxForPlan(
+  toolContext: string,
+  industry: ExpertIndustry
+): Promise<PlanOutput | null> {
+  const key = process.env.MINIMAX_API_KEY;
+  if (!key) return null;
+
+  const prompt = buildInterviewPlanPrompt(toolContext, industry);
+
+  const response = await fetch(`${BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+      n: 1,
+      stream: false,
+      max_completion_tokens: 900,
+    }),
+  });
+
+  if (!response.ok) return null;
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) return null;
+
+  const cleaned = sanitizeModelText(content);
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+
+  try {
+    const parsed = JSON.parse(cleaned.slice(start, end + 1)) as PlanOutput;
+    if (!Array.isArray(parsed.plan)) return null;
+    const plan = parsed.plan
+      .map((x) => (typeof x === "string" ? x.trim() : ""))
+      .filter(Boolean)
+      .slice(0, 5);
+    const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+    if (plan.length === 0) return null;
+    return { plan, summary };
+  } catch {
+    return null;
+  }
+}
+
+async function callMiniMaxForReplan(
+  messages: ChatMessage[],
+  industry: ExpertIndustry,
+  toolContext: string,
+  currentPlan: string[]
+): Promise<ReplanOutput | null> {
+  const key = process.env.MINIMAX_API_KEY;
+  if (!key) return null;
+
+  const conversationContext = messages
+    .slice(-12)
+    .map((m) => `${m.role}: ${m.content}`)
+    .join("\n");
+
+  const prompt = buildInterviewReplanPrompt(
+    industry,
+    currentPlan,
+    conversationContext,
+    toolContext
+  );
+
+  const response = await fetch(`${BASE_URL}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+      n: 1,
+      stream: false,
+      max_completion_tokens: 900,
+    }),
+  });
+
+  if (!response.ok) return null;
+
+  const data = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) return null;
+
+  const cleaned = sanitizeModelText(content);
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+
+  try {
+    const parsed = JSON.parse(cleaned.slice(start, end + 1)) as ReplanOutput;
+    const plan = normalizePlanItems(parsed.plan, 8);
+    const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+    if (plan.length === 0) return null;
+    return { plan, summary };
+  } catch {
+    return null;
+  }
+}
+
+async function maybeReplanInterviewPlan(
+  messages: ChatMessage[],
+  industry: ExpertIndustry,
+  toolContext: string,
+  currentPlan: string[]
+): Promise<{ plan: string[]; updated: boolean; summary?: string }> {
+  if (currentPlan.length === 0 && !toolContext) {
+    return { plan: currentPlan, updated: false };
+  }
+
+  const replanResult = await Promise.race([
+    callMiniMaxForReplan(messages, industry, toolContext, currentPlan),
+    new Promise<null>((resolve) => {
+      setTimeout(() => resolve(null), REPLAN_TIMEOUT_MS);
+    }),
+  ]);
+
+  if (!replanResult || replanResult.plan.length === 0) {
+    return { plan: currentPlan, updated: false };
+  }
+
+  const nextPlan = normalizePlanItems(replanResult.plan, 8);
+  const updated = JSON.stringify(nextPlan) !== JSON.stringify(currentPlan);
+  return { plan: nextPlan, updated, summary: replanResult.summary };
 }
 
 async function callMiniMaxForReport(
@@ -500,29 +752,92 @@ async function callMiniMaxForReport(
   }
 }
 
+async function buildReportResult(
+  messages: ChatMessage[],
+  industry: ExpertIndustry,
+  toolContext: string
+) {
+  const reportFromModel = await callMiniMaxForReport(messages, industry, toolContext);
+  const answers = reportFromModel?.answers ?? deriveAnswersFromMessages(messages);
+  const report = reportFromModel?.report ?? fallbackDistill(answers);
+  const score = calculateScore(answers);
+
+  return {
+    answers,
+    report,
+    score,
+    modelUsed: reportFromModel ? "LLM" : "fallback",
+  };
+}
+
 export async function POST(request: Request) {
   try {
     const payload = (await request.json()) as DistillPayload;
-    if (!validateMessages(payload.messages)) {
+    const mode = payload.mode || "reply";
+
+    if (mode !== "plan" && !validateMessages(payload.messages)) {
       return NextResponse.json(
         { error: "无效输入，请检查对话内容。" },
         { status: 400 }
       );
     }
 
-    const mode = payload.mode || "reply";
-    const messages = payload.messages;
+    const messages = payload.messages ?? [];
     const industry = resolveIndustry(payload.industry);
     const fastTrack = Boolean(payload.fastTrack);
     const stream = Boolean(payload.stream);
     const toolContext = normalizeToolContext(payload.toolContext);
+    const interviewPlan = normalizePlanItems(payload.interviewPlan, 8);
     const sessionId = typeof payload.sessionId === "string" && payload.sessionId
       ? payload.sessionId
       : randomUUID();
 
+    if (mode === "plan") {
+      if (!toolContext) {
+        return NextResponse.json(
+          { error: "请先上传资料或提供可读取链接后再生成访谈计划。" },
+          { status: 400 }
+        );
+      }
+      const planResult = (await callMiniMaxForPlan(toolContext, industry)) ?? fallbackPlan(toolContext);
+      void logChatEvent(sessionId, {
+        event: "plan",
+        ts: new Date().toISOString(),
+        sessionId,
+        industry,
+        plan: planResult.plan,
+        summary: planResult.summary,
+      });
+      return NextResponse.json(planResult);
+    }
+
     if (mode === "reply") {
       const userTurns = messages.filter((m) => m.role === "user").length;
       const stage = getReplyStage(userTurns, fastTrack);
+      const replanResult = await maybeReplanInterviewPlan(
+        messages,
+        industry,
+        toolContext,
+        interviewPlan
+      );
+      const effectiveInterviewPlan = replanResult.plan;
+
+      // Log full request snapshot for every reply turn.
+      void logChatEvent(sessionId, {
+        event: "reply_request",
+        ts: new Date().toISOString(),
+        sessionId,
+        industry,
+        fastTrack,
+        stream,
+        stage,
+        userTurnCount: userTurns,
+        messages,
+        toolContext,
+        interviewPlan: effectiveInterviewPlan,
+        replanUpdated: replanResult.updated,
+        replanSummary: replanResult.summary,
+      });
 
       if (stream) {
         const replyStream = await createMiniMaxReplyStream(
@@ -530,22 +845,22 @@ export async function POST(request: Request) {
           industry,
           fastTrack,
           stage,
-          toolContext
+          toolContext,
+          effectiveInterviewPlan,
+          (assistantReply, status) => {
+            void logChatEvent(sessionId, {
+              event: "reply_response",
+              ts: new Date().toISOString(),
+              sessionId,
+              status,
+              assistantReply,
+            });
+          },
+          {
+            interviewPlan: effectiveInterviewPlan,
+            planUpdated: replanResult.updated,
+          }
         );
-
-        // Log the latest user turn (fire-and-forget)
-        const lastUserMsg = [...messages].reverse().find((m) => m.role === "user");
-        if (lastUserMsg) {
-          void logChatEvent({
-            event: "turn",
-            ts: new Date().toISOString(),
-            sessionId,
-            industry,
-            fastTrack,
-            userTurnCount: userTurns,
-            userMessage: lastUserMsg.content,
-          });
-        }
 
         return new Response(replyStream, {
           headers: {
@@ -556,29 +871,117 @@ export async function POST(request: Request) {
       }
 
       const assistantReply =
-        (await callMiniMaxForReply(messages, industry, fastTrack, toolContext)) ??
+        (await callMiniMaxForReply(
+          messages,
+          industry,
+          fastTrack,
+          toolContext,
+          effectiveInterviewPlan
+        )) ??
         fallbackReply(messages, industry, fastTrack);
+
+      void logChatEvent(sessionId, {
+        event: "reply_response",
+        ts: new Date().toISOString(),
+        sessionId,
+        status: "done",
+        assistantReply,
+      });
+
       return NextResponse.json({
         assistantReply,
         stage,
+        interviewPlan: effectiveInterviewPlan,
+        planUpdated: replanResult.updated,
       });
     }
 
-    const reportFromModel = await callMiniMaxForReport(
-      messages,
-      industry,
-      toolContext
-    );
-    const answers = reportFromModel?.answers ?? deriveAnswersFromMessages(messages);
-    const report = reportFromModel?.report ?? fallbackDistill(answers);
-    const score = calculateScore(answers);
+    if (stream) {
+      const encoder = new TextEncoder();
+      const reportStream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const emit = (chunk: Record<string, unknown>) => {
+            controller.enqueue(encoder.encode(`${JSON.stringify(chunk)}\n`));
+          };
 
-    console.log("[distill/report] answers:", JSON.stringify(answers));
-    console.log("[distill/report] score:", JSON.stringify(score));
-    console.log("[distill/report] modelUsed:", reportFromModel ? "LLM" : "fallback");
+          try {
+            emit({
+              type: "status",
+              stage: "collecting",
+              progress: 12,
+              message: "正在整理你的访谈关键信号…",
+            });
+
+            const reportResult = await buildReportResult(messages, industry, toolContext);
+
+            emit({
+              type: "status",
+              stage: "scoring",
+              progress: 76,
+              message: "正在计算不可替代指数与维度分布…",
+            });
+
+            emit({
+              type: "status",
+              stage: "finalizing",
+              progress: 92,
+              message: "正在生成行动建议与发展策略…",
+            });
+
+            console.log("[distill/report] answers:", JSON.stringify(reportResult.answers));
+            console.log("[distill/report] score:", JSON.stringify(reportResult.score));
+            console.log("[distill/report] modelUsed:", reportResult.modelUsed);
+
+            // Log full session on report generation (fire-and-forget)
+            void logChatEvent(sessionId, {
+              event: "report",
+              ts: new Date().toISOString(),
+              sessionId,
+              industry,
+              fastTrack,
+              userTurnCount: messages.filter((m) => m.role === "user").length,
+              messages,
+              answers: reportResult.answers,
+              score: reportResult.score,
+              distillation: reportResult.report,
+            });
+
+            emit({
+              type: "result",
+              distillation: reportResult.report,
+              score: reportResult.score,
+              answers: reportResult.answers,
+            });
+            emit({
+              type: "done",
+              progress: 100,
+              message: "报告已完成",
+            });
+            controller.close();
+          } catch (error) {
+            console.error("[distill/report] stream error:", error);
+            emit({ type: "error", error: "报告生成失败，请稍后重试。" });
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(reportStream, {
+        headers: {
+          "Content-Type": "application/x-ndjson; charset=utf-8",
+          "Cache-Control": "no-cache, no-transform",
+        },
+      });
+    }
+
+    const reportResult = await buildReportResult(messages, industry, toolContext);
+
+    console.log("[distill/report] answers:", JSON.stringify(reportResult.answers));
+    console.log("[distill/report] score:", JSON.stringify(reportResult.score));
+    console.log("[distill/report] modelUsed:", reportResult.modelUsed);
 
     // Log full session on report generation (fire-and-forget)
-    void logChatEvent({
+    void logChatEvent(sessionId, {
       event: "report",
       ts: new Date().toISOString(),
       sessionId,
@@ -586,12 +989,16 @@ export async function POST(request: Request) {
       fastTrack,
       userTurnCount: messages.filter((m) => m.role === "user").length,
       messages,
-      answers,
-      score,
-      distillation: report,
+      answers: reportResult.answers,
+      score: reportResult.score,
+      distillation: reportResult.report,
     });
 
-    return NextResponse.json({ distillation: report, score, answers });
+    return NextResponse.json({
+      distillation: reportResult.report,
+      score: reportResult.score,
+      answers: reportResult.answers,
+    });
   } catch (err) {
     console.error("[distill] unexpected error:", err);
     return NextResponse.json(

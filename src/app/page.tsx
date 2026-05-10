@@ -12,6 +12,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import { tierNarrative, type ScoreBreakdown } from "@/lib/scoring";
 import {
+  AGENT_NAME,
   OPENING_ASSISTANT_MESSAGE,
   type ExpertIndustry,
 } from "@/lib/prompts";
@@ -32,12 +33,19 @@ type AnalyzeResponse = {
   score: ScoreBreakdown;
 };
 
+type PlanResponse = {
+  plan: string[];
+  summary: string;
+  error?: string;
+};
+
 type ChatHistorySnapshot = {
   messages: ChatMessage[];
   chatIndustry: ExpertIndustry;
   fastTrack: boolean;
   toolContext: string;
   importedSources: ImportedSource[];
+  interviewPlan: string[];
 };
 
 type SessionSnapshot = ChatHistorySnapshot & {
@@ -63,7 +71,22 @@ type IngestResponse = {
 
 type ReplyStreamEvent =
   | { type: "delta"; content: string }
-  | { type: "done"; stage?: string }
+  | {
+      type: "done";
+      stage?: string;
+      interviewPlan?: string[];
+      planUpdated?: boolean;
+    }
+  | { type: "error"; error?: string };
+
+type ReportStreamEvent =
+  | { type: "status"; stage?: string; progress?: number; message?: string }
+  | {
+      type: "result";
+      distillation: AnalyzeResponse["distillation"];
+      score: AnalyzeResponse["score"];
+    }
+  | { type: "done"; progress?: number; message?: string }
   | { type: "error"; error?: string };
 
 const SESSIONS_STORAGE_KEY = "expert-value-mvp.sessions.v2";
@@ -82,6 +105,8 @@ const OPENING_MESSAGE: ChatMessage = {
   role: "assistant",
   content: OPENING_ASSISTANT_MESSAGE,
 };
+
+const PLAN_WARMUP_WAIT_MS = 1200;
 
 const markdownComponents = {
   p: (props: React.HTMLAttributes<HTMLParagraphElement>) => (
@@ -146,6 +171,9 @@ export default function Home() {
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState("");
   const [toolContext, setToolContext] = useState("");
+  const [interviewPlan, setInterviewPlan] = useState<string[]>([]);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState("");
   const [importedSources, setImportedSources] = useState<ImportedSource[]>([]);
   const [ingestingLabel, setIngestingLabel] = useState("");
   const [allSessions, setAllSessions] = useState<SessionSnapshot[]>([]);
@@ -154,10 +182,19 @@ export default function Home() {
 
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const composeInputRef = useRef<HTMLTextAreaElement>(null);
+  const attachInputRef = useRef<HTMLInputElement>(null);
+  const pendingPlanPromiseRef = useRef<Promise<string[] | null> | null>(null);
+  const reportAbortRef = useRef<AbortController | null>(null);
 
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState("");
   const [result, setResult] = useState<AnalyzeResponse | null>(null);
+  const [reportProgress, setReportProgress] = useState<{
+    stage: string;
+    progress: number;
+    message: string;
+  } | null>(null);
 
   const [leadName, setLeadName] = useState("");
   const [leadEmail, setLeadEmail] = useState("");
@@ -295,6 +332,7 @@ export default function Home() {
         if (typeof latest.fastTrack === "boolean") setFastTrack(latest.fastTrack);
         if (typeof latest.toolContext === "string") setToolContext(latest.toolContext);
         if (Array.isArray(latest.importedSources)) setImportedSources(latest.importedSources);
+        if (Array.isArray(latest.interviewPlan)) setInterviewPlan(latest.interviewPlan);
       } else {
         const id = makeSessionId();
         setActiveSessionId(id);
@@ -315,6 +353,7 @@ export default function Home() {
       fastTrack,
       toolContext,
       importedSources,
+      interviewPlan,
     };
     setAllSessions((prev) => {
       const rest = prev.filter((s) => s.id !== activeSessionId);
@@ -323,7 +362,7 @@ export default function Home() {
       return next;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [historyReady, messages, chatIndustry, fastTrack, toolContext, importedSources]);
+  }, [historyReady, messages, chatIndustry, fastTrack, toolContext, importedSources, interviewPlan]);
 
   // ── auto-scroll ───────────────────────────────────────────────
   useEffect(() => {
@@ -340,8 +379,12 @@ export default function Home() {
     setChatError("");
     setAnalyzeError("");
     setToolContext("");
+    setInterviewPlan([]);
+    setPlanLoading(false);
+    setPlanError("");
     setImportedSources([]);
     setShowSessions(false);
+    pendingPlanPromiseRef.current = null;
   };
 
   const switchToSession = (session: SessionSnapshot) => {
@@ -351,10 +394,14 @@ export default function Home() {
     setFastTrack(session.fastTrack);
     setToolContext(session.toolContext);
     setImportedSources(session.importedSources);
+    setInterviewPlan(Array.isArray(session.interviewPlan) ? session.interviewPlan : []);
+    setPlanLoading(false);
+    setPlanError("");
     setResult(null);
     setChatError("");
     setAnalyzeError("");
     setShowSessions(false);
+    pendingPlanPromiseRef.current = null;
   };
 
   const deleteSession = (id: string) => {
@@ -412,6 +459,75 @@ export default function Home() {
     return merged;
   };
 
+  const generateInterviewPlan = (activeToolContext: string): Promise<string[] | null> => {
+    if (!activeToolContext.trim()) return Promise.resolve(null);
+
+    const planPromise = (async (): Promise<string[] | null> => {
+      setPlanLoading(true);
+      setPlanError("");
+      try {
+        const response = await fetch("/api/distill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mode: "plan",
+            industry: chatIndustry,
+            toolContext: activeToolContext,
+            sessionId: activeSessionId,
+          }),
+        });
+        const body = (await response.json()) as PlanResponse;
+        if (!response.ok || !Array.isArray(body.plan) || body.plan.length === 0) {
+          throw new Error(body.error || "访谈计划生成失败，请重试。");
+        }
+        const plan = body.plan.slice(0, 5);
+        setInterviewPlan(plan);
+        return plan;
+      } catch (error) {
+        setPlanError(error instanceof Error ? error.message : "访谈计划生成失败，请重试。");
+        return null;
+      } finally {
+        setPlanLoading(false);
+      }
+    })();
+
+    pendingPlanPromiseRef.current = planPromise;
+    void planPromise.finally(() => {
+      if (pendingPlanPromiseRef.current === planPromise) {
+        pendingPlanPromiseRef.current = null;
+      }
+    });
+
+    return planPromise;
+  };
+
+  const resolvePlanForCurrentTurn = async (
+    activeToolContext: string,
+    initiatedPlanPromise?: Promise<string[] | null>
+  ): Promise<string[] | undefined> => {
+    if (!activeToolContext.trim()) return undefined;
+
+    if (interviewPlan.length > 0) {
+      return interviewPlan;
+    }
+
+    const pendingPlan = initiatedPlanPromise ?? pendingPlanPromiseRef.current;
+    if (!pendingPlan) return undefined;
+
+    const warmPlan = await Promise.race([
+      pendingPlan,
+      new Promise<null>((resolve) => {
+        setTimeout(() => resolve(null), PLAN_WARMUP_WAIT_MS);
+      }),
+    ]);
+
+    if (Array.isArray(warmPlan) && warmPlan.length > 0) {
+      return warmPlan;
+    }
+
+    return undefined;
+  };
+
   // Drain NDJSON stream into messages at placeholderIdx
   const drainStream = async (
     body: ReadableStream<Uint8Array>,
@@ -442,6 +558,15 @@ export default function Home() {
             return updated;
           });
         }
+        if (chunk.type === "done" && Array.isArray(chunk.interviewPlan)) {
+          const nextPlan = chunk.interviewPlan
+            .map((x) => (typeof x === "string" ? x.trim() : ""))
+            .filter(Boolean)
+            .slice(0, 8);
+          if (nextPlan.length > 0) {
+            setInterviewPlan(nextPlan);
+          }
+        }
         if (chunk.type === "error") throw new Error(chunk.error || "流式对话失败，请稍后重试。");
       }
     }
@@ -462,7 +587,8 @@ export default function Home() {
   const dispatchToDistill = async (
     conversationMessages: ChatMessage[],
     activeToolContext: string,
-    messagesAlreadySet = false
+    messagesAlreadySet = false,
+    activeInterviewPlan?: string[]
   ) => {
     const placeholderIdx = conversationMessages.length;
     if (messagesAlreadySet) {
@@ -473,6 +599,7 @@ export default function Home() {
     }
     setChatError("");
     setChatLoading(true);
+    const effectivePlan = activeInterviewPlan ?? interviewPlan;
     try {
       const response = await fetch("/api/distill", {
         method: "POST",
@@ -485,6 +612,7 @@ export default function Home() {
           stream: true,
           toolContext: activeToolContext,
           sessionId: activeSessionId,
+          interviewPlan: effectivePlan,
         }),
       });
       if (!response.ok || !response.body) {
@@ -526,7 +654,14 @@ export default function Home() {
       role: "user",
       content: `【tool_result】文档《${result.title}》内容已加载完毕（${result.chars.toLocaleString()} 字），请基于文档内容继续访谈。`,
     };
-    await dispatchToDistill([...messages, toolCallMsg, toolResultMsg], activeToolContext);
+    const planPromise = generateInterviewPlan(activeToolContext);
+    const warmPlan = await resolvePlanForCurrentTurn(activeToolContext, planPromise);
+    await dispatchToDistill(
+      [...messages, toolCallMsg, toolResultMsg],
+      activeToolContext,
+      false,
+      warmPlan
+    );
   };
 
   const handleInputKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -536,10 +671,24 @@ export default function Home() {
     void sendMessage(event as unknown as FormEvent<HTMLFormElement>);
   };
 
+  const startDirectInterview = () => {
+    const seed = "我先直接开始。你可以叫我____。";
+    setInput((prev) => (prev.trim() ? prev : seed));
+    requestAnimationFrame(() => {
+      composeInputRef.current?.focus();
+    });
+  };
+
+  const triggerUpload = () => {
+    attachInputRef.current?.click();
+  };
+
   const sendMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const text = input.trim();
     if (!text || chatLoading) return;
+
+    const urlMatch = text.match(/https?:\/\/[^\s，。！？""'']+/);
 
     setInput("");
 
@@ -551,11 +700,11 @@ export default function Home() {
     let activeToolContext = toolContext;
 
     // Agent tool call: URL detected → fetch → inject tool-call + tool-result into message chain
-    const urlMatch = text.match(/https?:\/\/[^\s，。！？""'']+/);
     if (urlMatch) {
       const result = await runToolFetch({ htmlUrl: urlMatch[0] });
       if (result) {
         activeToolContext = applyIngestResult(result, activeToolContext);
+        const planPromise = generateInterviewPlan(activeToolContext);
         const toolCallMsg: ChatMessage = {
           role: "assistant",
           content: `【tool:fetch_url】读取链接《${result.title}》，共 ${result.chars.toLocaleString()} 字`,
@@ -567,18 +716,36 @@ export default function Home() {
         // Append tool-call chip to visible messages
         setMessages((prev) => [...prev, toolCallMsg, toolResultMsg]);
         conversationMessages = [...conversationMessages, toolCallMsg, toolResultMsg];
+        const warmPlan = await resolvePlanForCurrentTurn(activeToolContext, planPromise);
+        await dispatchToDistill(
+          conversationMessages,
+          activeToolContext,
+          true,
+          warmPlan
+        );
+        return;
       }
     }
 
-    await dispatchToDistill(conversationMessages, activeToolContext, true);
+    const warmPlan = await resolvePlanForCurrentTurn(activeToolContext);
+    await dispatchToDistill(conversationMessages, activeToolContext, true, warmPlan);
   };
 
   const generateReport = async () => {
     if (!contentReady || analyzing) return;
 
+    reportAbortRef.current?.abort();
+    const abortController = new AbortController();
+    reportAbortRef.current = abortController;
+
     setAnalyzing(true);
     setAnalyzeError("");
     setLeadMessage("");
+    setReportProgress({
+      stage: "collecting",
+      progress: 6,
+      message: "正在整理访谈素材…",
+    });
     try {
       const response = await fetch("/api/distill", {
         method: "POST",
@@ -588,22 +755,97 @@ export default function Home() {
           messages,
           industry: chatIndustry,
           fastTrack,
+          stream: true,
           toolContext,
           sessionId: activeSessionId,
         }),
+        signal: abortController.signal,
       });
 
-      const body = (await response.json()) as AnalyzeResponse & { error?: string };
-      if (!response.ok) {
-        throw new Error(body.error || "生成报告失败，请稍后重试。");
+      if (!response.ok || !response.body) {
+        const body = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error || "生成报告失败，请稍后重试。");
       }
 
-      setResult(body);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let event: ReportStreamEvent;
+          try {
+            event = JSON.parse(line) as ReportStreamEvent;
+          } catch {
+            continue;
+          }
+
+          if (event.type === "status") {
+            setReportProgress({
+              stage: event.stage || "processing",
+              progress: typeof event.progress === "number" ? event.progress : 35,
+              message: event.message || "正在生成报告…",
+            });
+            continue;
+          }
+
+          if (event.type === "result") {
+            setResult({
+              distillation: event.distillation,
+              score: event.score,
+            });
+            setReportProgress({
+              stage: "completed",
+              progress: 100,
+              message: "报告已生成完成",
+            });
+            continue;
+          }
+
+          if (event.type === "done") {
+            setReportProgress((prev) => ({
+              stage: "completed",
+              progress: 100,
+              message: event.message || prev?.message || "报告已完成",
+            }));
+            continue;
+          }
+
+          if (event.type === "error") {
+            throw new Error(event.error || "生成报告失败，请稍后重试。");
+          }
+        }
+      }
     } catch (error) {
-      setAnalyzeError(error instanceof Error ? error.message : "生成报告失败，请稍后重试。");
+      const isAbort = error instanceof Error && error.name === "AbortError";
+      setAnalyzeError(
+        isAbort
+          ? "已取消本次报告生成。"
+          : error instanceof Error
+          ? error.message
+          : "生成报告失败，请稍后重试。"
+      );
+      if (isAbort) {
+        setReportProgress(null);
+      }
     } finally {
       setAnalyzing(false);
+      if (reportAbortRef.current === abortController) {
+        reportAbortRef.current = null;
+      }
     }
+  };
+
+  const cancelReportGeneration = () => {
+    reportAbortRef.current?.abort();
   };
 
   const onLeadSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -648,7 +890,7 @@ export default function Home() {
         <h1 className="text-xl font-black text-slate-900 sm:text-2xl">
           你会被AI替代吗？测算你的<span className="bg-gradient-to-r from-accent-2 to-accent bg-clip-text text-transparent">不可替代指数</span>
         </h1>
-        <p className="text-sm text-slate-500">通过深度追问，提炼那些机器无法复制的隐性专业价值</p>
+        <p className="text-sm text-slate-500">AI正在快速吃掉标准化能力。现在做一次深度访谈，提前看清你的风险位和升级方向。</p>
       </section>
 
       <section className="grid grid-cols-1 gap-6 lg:grid-cols-[1.1fr_0.9fr]">
@@ -676,8 +918,25 @@ export default function Home() {
             </div>
           </div>
           <p className="mt-2 text-sm text-slate-600">
-            真正有价值的判断往往不在简历里。用脱敏信息描述你的真实决策过程——那是机器最难学会的部分。
+            默认路径是直接开始深度访谈；你也可以上传资料或粘贴 URL 作为增强输入。{AGENT_NAME}会在对话中持续生成并更新专属访谈计划。
           </p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={startDirectInterview}
+              className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-semibold text-slate-600 transition-colors hover:border-slate-400 hover:text-slate-800"
+            >
+              直接开始
+            </button>
+            <button
+              type="button"
+              onClick={triggerUpload}
+              className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-500 transition-colors hover:border-slate-300 hover:text-slate-700"
+            >
+              上传资料增强计划
+            </button>
+            <span className="text-[11px] text-slate-400">上传是可选项，不会阻塞访谈</span>
+          </div>
 
           {/* Sessions panel */}
           {showSessions && (
@@ -735,13 +994,38 @@ export default function Home() {
             </div>
           ) : null}
 
+          <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-semibold text-slate-600">专属深度访谈计划</p>
+              {planLoading ? (
+                <span className="text-[11px] text-slate-400 animate-pulse">生成中…</span>
+              ) : null}
+            </div>
+            {!toolContext.trim() ? (
+              <p className="mt-1 text-xs text-slate-400">
+                当前未上传资料。你仍可直接开始，系统会先深挖你的案例，并在过程中逐步补齐访谈计划。
+              </p>
+            ) : interviewPlan.length > 0 ? (
+              <ol className="mt-2 space-y-1 text-xs text-slate-600">
+                {interviewPlan.map((item, idx) => (
+                  <li key={`${idx}-${item}`} className="rounded-md bg-white px-2 py-1">
+                    {idx + 1}. {item}
+                  </li>
+                ))}
+              </ol>
+            ) : (
+              <p className="mt-1 text-xs text-slate-400">资料已就绪，访谈计划正在生成或更新。</p>
+            )}
+            {planError ? <p className="mt-1 text-xs text-red-500">{planError}</p> : null}
+          </div>
+
           {/* Interview progress bar — content-based */}
           {(() => {
             const stage =
               coverageCount === 0
                 ? "开始分享你的真实经验"
                 : coverageCount < 2
-                ? "继续深入，问问正在提炼要点"
+                ? `继续深入，${AGENT_NAME}正在提炼要点`
                 : contentReady
                 ? "内容已充足，可生成报告"
                 : "继续补齐关键细节";
@@ -860,6 +1144,7 @@ export default function Home() {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
                 </svg>
                 <input
+                  ref={attachInputRef}
                   type="file"
                   accept=".txt,.md,.html,.htm"
                   onChange={handleAttachFile}
@@ -868,11 +1153,12 @@ export default function Home() {
               </label>
 
               <textarea
+                ref={composeInputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleInputKeyDown}
                 rows={3}
-                placeholder="聊聊你的真实思考，越反直觉的经验，护城河越深……"
+                placeholder="随便聊聊你最近在做什么就好。AI变化很快，我们把你的真本事聊清楚；资料或 URL 随时补。"
                 className="w-full resize-none rounded-2xl py-3 pr-14 pl-11 text-sm outline-none placeholder:text-slate-400"
               />
 
@@ -892,6 +1178,9 @@ export default function Home() {
                 )}
               </button>
             </div>
+            <p className="mt-2 text-xs text-slate-400">
+              Enter 发送，Shift + Enter 换行。未上传资料也可直接开始。
+            </p>
             {chatError ? <p className="mt-2 text-sm font-medium text-red-600">{chatError}</p> : null}
             {analyzeError ? <p className="mt-2 text-sm font-medium text-red-600">{analyzeError}</p> : null}
           </form>
@@ -903,6 +1192,34 @@ export default function Home() {
           <div className="mt-2 h-0.5 w-12 rounded-full bg-gradient-to-r from-accent-2 to-accent" />
           {!result ? (
             <div className="mt-6 space-y-5">
+              {analyzing && reportProgress ? (
+                <div className="rounded-2xl border border-slate-200 bg-white p-4">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm font-semibold text-slate-800">正在生成不可替代指数报告</p>
+                    <button
+                      type="button"
+                      onClick={cancelReportGeneration}
+                      className="rounded-full border border-slate-300 px-3 py-1 text-[11px] font-semibold text-slate-500 hover:bg-slate-50"
+                    >
+                      取消
+                    </button>
+                  </div>
+                  <p className="mt-1 text-xs text-slate-500">{reportProgress.message}</p>
+                  <div className="mt-3 h-2 w-full overflow-hidden rounded-full bg-slate-100">
+                    <div
+                      className="h-full rounded-full bg-gradient-to-r from-accent-2 to-accent transition-all duration-500"
+                      style={{ width: `${Math.max(6, Math.min(100, reportProgress.progress))}%` }}
+                    />
+                  </div>
+                  <div className="mt-2 flex items-center justify-between">
+                    <span className="text-[11px] text-slate-400">阶段：{reportProgress.stage}</span>
+                    <span className="text-[11px] font-semibold text-slate-500">
+                      {Math.max(6, Math.min(100, reportProgress.progress))}%
+                    </span>
+                  </div>
+                </div>
+              ) : null}
+
               <p className="text-sm leading-7 text-slate-600">
                 AI每天都在&ldquo;学习&rdquo;你的行业。完成追问后，这里将生成你的不可替代指数评分——哪些能力机器还拿不走，哪些正面临被替代的风险，以及你该如何加固护城河。
               </p>
