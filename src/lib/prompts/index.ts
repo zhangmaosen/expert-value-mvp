@@ -47,7 +47,7 @@ const INDUSTRY_PATHWAY: Record<ExpertIndustry, string> = {
 };
 
 export const OPENING_ASSISTANT_MESSAGE =
-  `我是${AGENT_NAME}，我们轻松聊聊。怎么称呼你？你现在主要做什么方向？资料或 URL 随时可补充，不影响访谈。`;
+  `欢迎来到${AGENT_NAME}聊天室。我们边聊边发现你那些AI难以替代的能力。先怎么称呼你？你现在主要在做什么方向？资料或 URL 随时补，不影响访谈节奏。`;
 
 export function buildInterviewSystemPrompt(
   industry: ExpertIndustry,
@@ -124,9 +124,10 @@ Agent 工具协议：对话历史中可能出现以下标记——
 
 export function buildInterviewPlanPrompt(
   toolContext: string,
-  industry: ExpertIndustry
+  industry: ExpertIndustry,
+  conversationContext?: string
 ): string {
-  return `你是资深访谈设计师。请基于用户资料，输出一份“深度访谈计划”，用于后续逐轮追问隐性知识。
+  return `你是资深访谈设计师。请基于用户资料与最新对话，输出一份“深度访谈计划”，用于后续逐轮追问隐性知识。
 
 目标：
 1) 从资料中提炼最值得深挖的能力信号
@@ -145,8 +146,13 @@ export function buildInterviewPlanPrompt(
 - 语言简洁，便于问答场景直接使用
 - 结合行业：${industry}（${INDUSTRY_FOCUS[industry]}）
 
+若无外部资料，也必须基于对话线索生成可执行计划；禁止输出“先上传资料再继续”。
+
+【最新对话】
+${conversationContext?.trim() || "（暂无，可先给低门槛开场计划）"}
+
 【用户资料】
-${toolContext}`;
+${toolContext || "（暂无）"}`;
 }
 
 export function buildInterviewReplanPrompt(

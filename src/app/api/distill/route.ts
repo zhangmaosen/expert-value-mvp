@@ -514,9 +514,14 @@ async function callMiniMaxForReply(
   return cleaned || null;
 }
 
-function fallbackPlan(toolContext: string): PlanOutput {
+function fallbackPlan(toolContext: string, messages: ChatMessage[] = []): PlanOutput {
   const base = toolContext.trim();
   const hasMaterial = base.length > 0;
+  const userTurns = messages
+    .filter((m) => m.role === "user")
+    .map((m) => m.content.trim())
+    .filter(Boolean);
+  const latestUserTurn = userTurns[userTurns.length - 1] || "";
   return {
     plan: hasMaterial
       ? [
@@ -527,11 +532,13 @@ function fallbackPlan(toolContext: string): PlanOutput {
           "提炼可迁移方法：如果让新人复现，你会给哪三条不可省略的判断准则？",
         ]
       : [
-          "先引导用户上传个人资料、报道或项目文档（或URL）。",
-          "确认资料真实性与代表性：哪段经历最能代表其核心能力。",
-          "围绕该经历追问关键判断与取舍。",
-          "补全结果与复盘细节，识别可复制方法。",
-          "形成可迁移的能力框架并进入深访。",
+          latestUserTurn
+            ? `先从你刚提到的这段经历展开：${latestUserTurn.slice(0, 40)}…当时你的目标和角色分别是什么？`
+            : "先用一个最近的真实场景开场：你当时的目标、角色和约束分别是什么？",
+          "追问关键判断：在多个可选方案里，你为什么先排除了其他选项？",
+          "拆解决策取舍：时间、资源、风险冲突时，你优先保护了什么？",
+          "回看结果与修正：哪些信号证明判断有效，哪些地方后来被你改写？",
+          "沉淀可迁移方法：如果让新人复现，你会给出哪三条判断准则？",
         ],
     summary: "按场景-判断-取舍-结果-迁移的路径逐层深挖，确保访谈有结构且可落地。",
   };
@@ -539,12 +546,13 @@ function fallbackPlan(toolContext: string): PlanOutput {
 
 async function callMiniMaxForPlan(
   toolContext: string,
-  industry: ExpertIndustry
+  industry: ExpertIndustry,
+  conversationContext: string
 ): Promise<PlanOutput | null> {
   const key = process.env.MINIMAX_API_KEY;
   if (!key) return null;
 
-  const prompt = buildInterviewPlanPrompt(toolContext, industry);
+  const prompt = buildInterviewPlanPrompt(toolContext, industry, conversationContext);
 
   const response = await fetch(`${BASE_URL}/chat/completions`, {
     method: "POST",
@@ -659,7 +667,8 @@ async function maybeReplanInterviewPlan(
   toolContext: string,
   currentPlan: string[]
 ): Promise<{ plan: string[]; updated: boolean; summary?: string }> {
-  if (currentPlan.length === 0 && !toolContext) {
+  const hasUserTurns = messages.some((m) => m.role === "user" && m.content.trim());
+  if (currentPlan.length === 0 && !toolContext && !hasUserTurns) {
     return { plan: currentPlan, updated: false };
   }
 
@@ -671,6 +680,10 @@ async function maybeReplanInterviewPlan(
   ]);
 
   if (!replanResult || replanResult.plan.length === 0) {
+    if (currentPlan.length === 0 && hasUserTurns) {
+      const bootstrapped = fallbackPlan(toolContext, messages).plan;
+      return { plan: bootstrapped, updated: true };
+    }
     return { plan: currentPlan, updated: false };
   }
 
@@ -793,13 +806,23 @@ export async function POST(request: Request) {
       : randomUUID();
 
     if (mode === "plan") {
-      if (!toolContext) {
+      if (payload.messages && !validateMessages(payload.messages)) {
         return NextResponse.json(
-          { error: "请先上传资料或提供可读取链接后再生成访谈计划。" },
+          { error: "访谈计划生成失败：对话内容格式无效。" },
           { status: 400 }
         );
       }
-      const planResult = (await callMiniMaxForPlan(toolContext, industry)) ?? fallbackPlan(toolContext);
+
+      const conversationContext = messages
+        .filter((m) => m.role === "user")
+        .slice(-6)
+        .map((m) => m.content.trim())
+        .filter(Boolean)
+        .join("\n");
+
+      const planResult =
+        (await callMiniMaxForPlan(toolContext, industry, conversationContext)) ??
+        fallbackPlan(toolContext, messages);
       void logChatEvent(sessionId, {
         event: "plan",
         ts: new Date().toISOString(),

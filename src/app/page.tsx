@@ -459,9 +459,10 @@ export default function Home() {
     return merged;
   };
 
-  const generateInterviewPlan = (activeToolContext: string): Promise<string[] | null> => {
-    if (!activeToolContext.trim()) return Promise.resolve(null);
-
+  const generateInterviewPlan = (
+    activeToolContext: string,
+    planMessages: ChatMessage[] = messages
+  ): Promise<string[] | null> => {
     const planPromise = (async (): Promise<string[] | null> => {
       setPlanLoading(true);
       setPlanError("");
@@ -473,6 +474,7 @@ export default function Home() {
             mode: "plan",
             industry: chatIndustry,
             toolContext: activeToolContext,
+            messages: planMessages,
             sessionId: activeSessionId,
           }),
         });
@@ -502,11 +504,9 @@ export default function Home() {
   };
 
   const resolvePlanForCurrentTurn = async (
-    activeToolContext: string,
+    _activeToolContext: string,
     initiatedPlanPromise?: Promise<string[] | null>
   ): Promise<string[] | undefined> => {
-    if (!activeToolContext.trim()) return undefined;
-
     if (interviewPlan.length > 0) {
       return interviewPlan;
     }
@@ -654,7 +654,10 @@ export default function Home() {
       role: "user",
       content: `【tool_result】文档《${result.title}》内容已加载完毕（${result.chars.toLocaleString()} 字），请基于文档内容继续访谈。`,
     };
-    const planPromise = generateInterviewPlan(activeToolContext);
+    const planPromise = generateInterviewPlan(
+      activeToolContext,
+      [...messages, toolCallMsg, toolResultMsg]
+    );
     const warmPlan = await resolvePlanForCurrentTurn(activeToolContext, planPromise);
     await dispatchToDistill(
       [...messages, toolCallMsg, toolResultMsg],
@@ -704,7 +707,6 @@ export default function Home() {
       const result = await runToolFetch({ htmlUrl: urlMatch[0] });
       if (result) {
         activeToolContext = applyIngestResult(result, activeToolContext);
-        const planPromise = generateInterviewPlan(activeToolContext);
         const toolCallMsg: ChatMessage = {
           role: "assistant",
           content: `【tool:fetch_url】读取链接《${result.title}》，共 ${result.chars.toLocaleString()} 字`,
@@ -713,6 +715,10 @@ export default function Home() {
           role: "user",
           content: `【tool_result】链接内容《${result.title}》已全量加载（${result.chars.toLocaleString()} 字）。请基于该内容继续访谈。`,
         };
+        const planPromise = generateInterviewPlan(
+          activeToolContext,
+          [...conversationMessages, toolCallMsg, toolResultMsg]
+        );
         // Append tool-call chip to visible messages
         setMessages((prev) => [...prev, toolCallMsg, toolResultMsg]);
         conversationMessages = [...conversationMessages, toolCallMsg, toolResultMsg];
@@ -727,7 +733,11 @@ export default function Home() {
       }
     }
 
-    const warmPlan = await resolvePlanForCurrentTurn(activeToolContext);
+    const initiatedPlanPromise =
+      interviewPlan.length === 0 && !pendingPlanPromiseRef.current
+        ? generateInterviewPlan(activeToolContext, conversationMessages)
+        : undefined;
+    const warmPlan = await resolvePlanForCurrentTurn(activeToolContext, initiatedPlanPromise);
     await dispatchToDistill(conversationMessages, activeToolContext, true, warmPlan);
   };
 
@@ -918,7 +928,7 @@ export default function Home() {
             </div>
           </div>
           <p className="mt-2 text-sm text-slate-600">
-            默认路径是直接开始深度访谈；你也可以上传资料或粘贴 URL 作为增强输入。{AGENT_NAME}会在对话中持续生成并更新专属访谈计划。
+            欢迎来到{AGENT_NAME}聊天室。你可以直接开聊；也可以上传资料或粘贴 URL 做增强输入。访谈计划会随对话实时生成并动态更新。
           </p>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
@@ -926,16 +936,16 @@ export default function Home() {
               onClick={startDirectInterview}
               className="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-semibold text-slate-600 transition-colors hover:border-slate-400 hover:text-slate-800"
             >
-              直接开始
+              进聊天室开聊
             </button>
             <button
               type="button"
               onClick={triggerUpload}
               className="rounded-full border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-500 transition-colors hover:border-slate-300 hover:text-slate-700"
             >
-              上传资料增强计划
+              上传资料（可选增强）
             </button>
-            <span className="text-[11px] text-slate-400">上传是可选项，不会阻塞访谈</span>
+            <span className="text-[11px] text-slate-400">不上传也能聊，计划照样动态更新</span>
           </div>
 
           {/* Sessions panel */}
@@ -1001,11 +1011,7 @@ export default function Home() {
                 <span className="text-[11px] text-slate-400 animate-pulse">生成中…</span>
               ) : null}
             </div>
-            {!toolContext.trim() ? (
-              <p className="mt-1 text-xs text-slate-400">
-                当前未上传资料。你仍可直接开始，系统会先深挖你的案例，并在过程中逐步补齐访谈计划。
-              </p>
-            ) : interviewPlan.length > 0 ? (
+            {interviewPlan.length > 0 ? (
               <ol className="mt-2 space-y-1 text-xs text-slate-600">
                 {interviewPlan.map((item, idx) => (
                   <li key={`${idx}-${item}`} className="rounded-md bg-white px-2 py-1">
@@ -1013,6 +1019,12 @@ export default function Home() {
                   </li>
                 ))}
               </ol>
+            ) : !toolContext.trim() && userTurnCount === 0 ? (
+              <p className="mt-1 text-xs text-slate-400">
+                欢迎开聊，无需先上传资料。你一开口，系统就会根据对话内容生成并持续更新访谈计划。
+              </p>
+            ) : !toolContext.trim() ? (
+              <p className="mt-1 text-xs text-slate-400">正在根据你刚才的交流动态生成访谈计划…</p>
             ) : (
               <p className="mt-1 text-xs text-slate-400">资料已就绪，访谈计划正在生成或更新。</p>
             )}
@@ -1158,7 +1170,7 @@ export default function Home() {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleInputKeyDown}
                 rows={3}
-                placeholder="随便聊聊你最近在做什么就好。AI变化很快，我们把你的真本事聊清楚；资料或 URL 随时补。"
+                placeholder={`欢迎来到${AGENT_NAME}聊天室。先随便聊聊你最近在做什么；资料或 URL 随时补，我们边聊边梳理。`}
                 className="w-full resize-none rounded-2xl py-3 pr-14 pl-11 text-sm outline-none placeholder:text-slate-400"
               />
 
@@ -1179,7 +1191,7 @@ export default function Home() {
               </button>
             </div>
             <p className="mt-2 text-xs text-slate-400">
-              Enter 发送，Shift + Enter 换行。未上传资料也可直接开始。
+              Enter 发送，Shift + Enter 换行。欢迎直接开聊，资料不是前置条件。
             </p>
             {chatError ? <p className="mt-2 text-sm font-medium text-red-600">{chatError}</p> : null}
             {analyzeError ? <p className="mt-2 text-sm font-medium text-red-600">{analyzeError}</p> : null}
